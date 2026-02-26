@@ -1840,17 +1840,12 @@
     const _postTimestamps = [];
 
     function _canPostNow() {
-      const now = Date.now();
-      const oneHour = 3600000;
-      // Prune old
-      while (_postTimestamps.length && now - _postTimestamps[0] > oneHour) _postTimestamps.shift();
-      return _postTimestamps.length < 3;
+      return true; // No rate limit
     }
 
     async function createPost({ content, imageUrl = null, videoUrl = null, visibility = 'circle' }) {
       if (!state.user || !state.userData) return;
       if (!content && !imageUrl && !videoUrl) { alert('Add some text, photo or video first.'); return; }
-      if (!_canPostNow()) { alert('You can only post 3 times per hour. Please wait.'); return; }
       // If visibility OFF, force circle
       if (!state.updatesVisibility && visibility === 'public') visibility = 'circle';
       _postTimestamps.push(Date.now());
@@ -1896,6 +1891,44 @@
     }
 
     
+    // ── Who liked ────────────────────────────────────────────────────────────
+    function showWhoLiked(postId) {
+      const post = (state.posts||[]).find(p => p.id === postId);
+      const likedBy = post?.likedBy || [];
+      if (!likedBy.length) { return; }
+      // Build name list from connections + own uid
+      const allKnown = [...(state.connections||[])];
+      if (state.userData) allKnown.push({ id: state.user.uid, name: state.userData.name, avatar: state.userData.avatar||'' });
+      const sheet = document.createElement('div');
+      sheet.id = 'likers-sheet';
+      sheet.style.cssText = 'position:fixed;inset:0;z-index:80;display:flex;flex-direction:column;justify-content:flex-end;';
+      sheet.innerHTML =
+        '<div id="ls-bg" style="position:absolute;inset:0;background:rgba(0,0,0,.55)"></div>' +
+        '<div style="position:relative;background:#111;border-radius:20px 20px 0 0;border-top:1px solid #333;max-height:65vh;display:flex;flex-direction:column;">' +
+          '<div style="width:36px;height:4px;background:#444;border-radius:2px;margin:12px auto 4px"></div>' +
+          '<div style="padding:12px 16px;border-bottom:1px solid #222;display:flex;align-items:center;justify-content:space-between">' +
+            '<span style="color:#fff;font-weight:600;font-size:15px">❤️ ' + likedBy.length + ' like' + (likedBy.length !== 1 ? 's' : '') + '</span>' +
+            '<button id="ls-close" style="width:28px;height:28px;border-radius:50%;background:#222;border:none;cursor:pointer;color:#aaa;font-size:16px">✕</button>' +
+          '</div>' +
+          '<div style="overflow-y:auto;padding:8px 16px">' +
+            likedBy.map(uid => {
+              const u = allKnown.find(c => c.id === uid);
+              const name = u?.name || 'Someone';
+              const avatar = u?.avatar || '';
+              return '<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #1a1a1a">' +
+                '<div style="width:40px;height:40px;border-radius:50%;overflow:hidden;background:#333;flex-shrink:0">' +
+                  (avatar ? '<img src="' + avatar + '" style="width:100%;height:100%;object-fit:cover"/>' : '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700">' + name.charAt(0) + '</div>') +
+                '</div>' +
+                '<span style="color:#fff;font-size:14px;font-weight:500">' + name + '</span>' +
+              '</div>';
+            }).join('') +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(sheet);
+      document.getElementById('ls-bg').onclick = () => sheet.remove();
+      document.getElementById('ls-close').onclick = () => sheet.remove();
+    }
+
     // ── Comment helpers ───────────────────────────────────────────────────────
     async function addComment(postId, text) {
       if (!state.user || !state.userData || !text.trim()) return;
@@ -2136,6 +2169,50 @@
 
     // Compress and convert image to Base64 with aggressive size reduction
     // High-quality image encoder — preserves quality, only downsizes if Firestore limit demands it
+    // Aggressive compressor specifically for chat images (must fit in Firestore 1MB doc)
+    function compressChatImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            let w = img.width, h = img.height;
+            const maxDim = 800; // Keep chat images small enough for Firestore
+            if (w > h) { if (w > maxDim) { h = Math.round(h * maxDim / w); w = maxDim; } }
+            else { if (h > maxDim) { w = Math.round(w * maxDim / h); h = maxDim; } }
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'medium';
+            ctx.drawImage(img, 0, 0, w, h);
+            // Target: well under 700KB base64 (Firestore safe margin)
+            const maxBytes = 700 * 1024;
+            let quality = 0.75;
+            let base64 = canvas.toDataURL('image/jpeg', quality);
+            while (base64.length > maxBytes && quality > 0.3) {
+              quality -= 0.1;
+              base64 = canvas.toDataURL('image/jpeg', quality);
+            }
+            // If still too big, shrink dimensions further
+            if (base64.length > maxBytes) {
+              const scale = Math.sqrt(maxBytes / base64.length) * 0.9;
+              canvas.width = Math.round(w * scale);
+              canvas.height = Math.round(h * scale);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              base64 = canvas.toDataURL('image/jpeg', 0.6);
+            }
+            log('Chat image: ' + w + 'x' + h + ' q=' + quality.toFixed(2) + ' size=' + Math.round(base64.length/1024) + 'KB');
+            resolve(base64);
+          };
+          img.onerror = () => reject(new Error('Failed to load image'));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsDataURL(file);
+      });
+    }
+
     function compressImageToBase64(file, maxSize = 1920) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -2420,7 +2497,7 @@
         if (type === 'image' || type === 'media') {
           if (file.type.startsWith('image/')) {
             // Show image preview modal like WhatsApp
-            const base64 = await compressImageToBase64(file, 1920);
+            const base64 = await compressChatImage(file);
             showImagePreviewModal(base64);
             log('Image preview shown');
           } else if (file.type.startsWith('video/')) {
@@ -3093,6 +3170,60 @@
       }
     }
     
+    // Delete a single message for everyone (removes from Firestore)
+    async function deleteMessageForEveryone(msgId) {
+      if (!msgId) return;
+      try {
+        await deleteDoc(doc(db, 'messages', msgId));
+        state.messages = state.messages.filter(m => m.id !== msgId);
+        const chatId = state.selectedChatId;
+        if (chatId) { allMessages[chatId] = [...state.messages]; localStorage.removeItem('linkup_msgs_' + chatId); }
+        updateMessages();
+        log('Message deleted for everyone');
+      } catch (e) { log('Delete error: ' + e.message); alert('Failed to delete message'); }
+    }
+
+    // Delete for me only (hides locally, marks deleted in Firestore)
+    async function deleteMessageForMe(msgId) {
+      if (!msgId) return;
+      state.messages = state.messages.filter(m => m.id !== msgId);
+      const chatId = state.selectedChatId;
+      if (chatId) { allMessages[chatId] = [...state.messages]; localStorage.setItem('linkup_msgs_' + chatId, JSON.stringify(state.messages)); }
+      updateMessages();
+      // Mark deleted in Firestore (soft delete)
+      try { await updateDoc(doc(db, 'messages', msgId), { deletedFor: [...((state.messages.find(m=>m.id===msgId)||{}).deletedFor||[]), state.user.uid] }); } catch(e) {}
+      log('Message hidden for me');
+    }
+
+    // Show delete options sheet for a message
+    function showMessageDeleteSheet(msgId, isOwn) {
+      document.getElementById('msg-delete-sheet')?.remove();
+      const sheet = document.createElement('div');
+      sheet.id = 'msg-delete-sheet';
+      sheet.style.cssText = 'position:fixed;inset:0;z-index:90;display:flex;flex-direction:column;justify-content:flex-end;';
+      const delEveryoneBtn = isOwn
+        ? `<button id="mds-del-all" style="width:100%;padding:16px;text-align:left;background:none;border:none;cursor:pointer;font-size:15px;color:#ef4444;display:flex;align-items:center;gap:12px;border-bottom:1px solid #f3f4f6">
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            Delete for everyone</button>`
+        : '';
+      sheet.innerHTML = `
+        <div id="mds-bg" style="position:absolute;inset:0;background:rgba(0,0,0,.5)"></div>
+        <div style="position:relative;background:#fff;border-radius:20px 20px 0 0;padding-bottom:env(safe-area-inset-bottom,16px)">
+          <div style="width:36px;height:4px;background:#ddd;border-radius:2px;margin:12px auto 8px"></div>
+          <p style="text-align:center;font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.05em;padding:0 16px 10px;border-bottom:1px solid #f3f4f6">Message</p>
+          ${delEveryoneBtn}
+          <button id="mds-del-me" style="width:100%;padding:16px;text-align:left;background:none;border:none;cursor:pointer;font-size:15px;color:#374151;display:flex;align-items:center;gap:12px;border-bottom:1px solid #f3f4f6">
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/></svg>
+            Delete for me</button>
+          <button id="mds-cancel" style="width:100%;padding:16px;text-align:left;background:none;border:none;cursor:pointer;font-size:15px;color:#6b7280">Cancel</button>
+        </div>`;
+      document.body.appendChild(sheet);
+      document.getElementById('mds-bg').onclick = () => sheet.remove();
+      document.getElementById('mds-cancel').onclick = () => sheet.remove();
+      document.getElementById('mds-del-me').onclick = () => { deleteMessageForMe(msgId); sheet.remove(); };
+      if (isOwn) document.getElementById('mds-del-all').onclick = () => { deleteMessageForEveryone(msgId); sheet.remove(); };
+    }
+
     async function sendMessage(text) {
       if (!text.trim() || !state.selectedChatId || !state.user) {
         log('Cannot send message - missing text, chatId, or user');
@@ -3581,10 +3712,16 @@
       const now = Date.now();
       const twentyFourHours = 24 * 60 * 60 * 1000;
       
-      // Get slides for this user from last 24 hours
+      // Get slides for this user that haven't expired
       currentUserSlides = (state.slides || []).filter(s => {
+        if (s.userId !== userId) return false;
+        // Use expiresAt if available, else fall back to 24h from createdAt
+        if (s.expiresAt) {
+          const expiry = s.expiresAt?.toDate?.() || new Date(s.expiresAt);
+          return expiry.getTime() > now;
+        }
         const slideTime = s.createdAt?.toDate?.() || new Date(s.createdAt);
-        return s.userId === userId && (now - slideTime.getTime()) < twentyFourHours;
+        return (now - slideTime.getTime()) < twentyFourHours;
       }).sort((a, b) => {
         const timeA = a.createdAt?.toDate?.() || new Date(a.createdAt);
         const timeB = b.createdAt?.toDate?.() || new Date(b.createdAt);
@@ -3643,7 +3780,7 @@
                    class="w-10 h-10 rounded-full object-cover border-2 border-white shadow-lg">
               <div>
                 <p class="text-white font-semibold text-shadow">${slide.userName}</p>
-                <p class="text-white/80 text-xs">${timeAgo}</p>
+                <p class="text-white/80 text-xs">${timeAgo}${slide.expiresAt ? ' · ' + (() => { const exp = slide.expiresAt?.toDate?.() || new Date(slide.expiresAt); const rem = exp - Date.now(); if(rem<=0) return 'expired'; const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return h>0?h+'h left':m+'m left'; })() : ''}</p>
               </div>
             </div>
             <div class="flex items-center gap-1">
@@ -3670,8 +3807,10 @@
         </div>
         
         <!-- Slide Content -->
-        <div class="absolute inset-0 flex items-center justify-center ${slide.imageUrl ? 'bg-black' : slide.backgroundColor || 'bg-gradient-to-br from-gray-800 to-black'}">
-          ${slide.imageUrl 
+        <div class="absolute inset-0 flex items-center justify-center ${slide.videoUrl ? 'bg-black' : slide.imageUrl ? 'bg-black' : slide.backgroundColor || 'bg-gradient-to-br from-gray-800 to-black'}">
+          ${slide.videoUrl
+            ? `<video src="${slide.videoUrl}" class="w-full h-full object-contain" autoplay loop playsinline controls></video>`
+            : slide.imageUrl 
             ? `<img src="${slide.imageUrl}" alt="Slide" class="w-full h-full object-contain">`
             : `<div class="p-8 flex items-center justify-center h-full">
                 <p class="text-white text-2xl md:text-3xl font-medium text-center leading-relaxed max-w-lg">${slide.content}</p>
@@ -3704,15 +3843,24 @@
           </div>
         ` : `
           <div class="absolute bottom-0 left-0 right-0 z-30 p-4 bg-gradient-to-t from-black/80 to-transparent">
-            <div class="flex items-center justify-center gap-4 text-white/80">
-              <div class="flex items-center gap-2">
+            <button id="show-slide-viewers" class="w-full flex items-center gap-3 text-white/90 hover:text-white transition-colors">
+              <div class="flex items-center gap-1.5">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
                 </svg>
-                <span class="text-sm">${currentSlideIndex + 1} of ${currentUserSlides.length}</span>
+                <span class="text-sm font-semibold">${(slide.viewedBy||[]).length} views</span>
               </div>
-            </div>
+              <div class="flex -space-x-1.5">
+                ${(slide.viewedBy||[]).slice(0,5).map(v => 
+                  v.avatar 
+                    ? '<img src="' + v.avatar + '" class="w-6 h-6 rounded-full border border-white/40 object-cover" title="' + (v.name||'') + '"/>'
+                    : '<div class="w-6 h-6 rounded-full border border-white/40 bg-gray-600 flex items-center justify-center text-[9px] text-white font-bold">' + (v.name||'?').charAt(0) + '</div>'
+                ).join('')}
+                ${(slide.viewedBy||[]).length > 5 ? '<div class="w-6 h-6 rounded-full border border-white/40 bg-gray-800 flex items-center justify-center text-[9px] text-white">+' + ((slide.viewedBy||[]).length-5) + '</div>' : ''}
+              </div>
+              <svg class="w-4 h-4 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+            </button>
           </div>
         `}
         
@@ -3807,6 +3955,24 @@
         content.innerHTML = renderSlideViewer(userId);
         attachSlideViewerListeners();
         startSlideProgress();
+        // Record that current user viewed these slides (if not own slides)
+        if (userId !== state.user?.uid && state.user && state.userData) {
+          const slides24h = (state.slides||[]).filter(s => s.userId === userId);
+          slides24h.forEach(async (slide) => {
+            const alreadyViewed = (slide.viewedBy||[]).some(v => v.uid === state.user.uid);
+            if (!alreadyViewed) {
+              try {
+                await updateDoc(doc(db, 'slides', slide.id), {
+                  viewedBy: [...(slide.viewedBy||[]), {
+                    uid: state.user.uid,
+                    name: state.userData.name,
+                    avatar: state.userData.avatar || ''
+                  }]
+                });
+              } catch(e) { log('View track error: ' + e.message); }
+            }
+          });
+        }
       }
     }
 
@@ -3827,6 +3993,41 @@
       document.getElementById('slide-prev-zone')?.addEventListener('click', (e) => {
         e.stopPropagation();
         goToPrevSlide();
+      });
+
+      // Who viewed button
+      document.getElementById('show-slide-viewers')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        stopSlideProgress();
+        const slide = currentUserSlides[currentSlideIndex];
+        const viewers = slide?.viewedBy || [];
+        const sheet = document.createElement('div');
+        sheet.id = 'viewers-sheet';
+        sheet.style.cssText = 'position:fixed;inset:0;z-index:90;display:flex;flex-direction:column;justify-content:flex-end;';
+        sheet.innerHTML =
+          '<div id="vs-bg" style="position:absolute;inset:0;background:rgba(0,0,0,.6)"></div>' +
+          '<div style="position:relative;background:#111;border-radius:20px 20px 0 0;border-top:1px solid #333;max-height:60vh;display:flex;flex-direction:column;">' +
+            '<div style="width:36px;height:4px;background:#444;border-radius:2px;margin:12px auto 4px"></div>' +
+            '<div style="padding:12px 16px;border-bottom:1px solid #222;display:flex;align-items:center;justify-content:space-between">' +
+              '<span style="color:#fff;font-weight:600;font-size:15px">👁 ' + viewers.length + ' viewer' + (viewers.length !== 1 ? 's' : '') + '</span>' +
+              '<button id="vs-close" style="width:28px;height:28px;border-radius:50%;background:#222;border:none;cursor:pointer;color:#aaa;font-size:16px">✕</button>' +
+            '</div>' +
+            '<div style="overflow-y:auto;padding:8px 16px">' +
+              (viewers.length === 0
+                ? '<p style="color:#666;text-align:center;padding:24px 0;font-size:14px">No views yet</p>'
+                : viewers.map(v =>
+                    '<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #1a1a1a">' +
+                      '<div style="width:40px;height:40px;border-radius:50%;overflow:hidden;background:#333;flex-shrink:0">' +
+                        (v.avatar ? '<img src="' + v.avatar + '" style="width:100%;height:100%;object-fit:cover"/>' : '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700">' + (v.name||'?').charAt(0) + '</div>') +
+                      '</div>' +
+                      '<span style="color:#fff;font-size:14px;font-weight:500">' + (v.name||'Unknown') + '</span>' +
+                    '</div>'
+                  ).join('')) +
+            '</div>' +
+          '</div>';
+        document.body.appendChild(sheet);
+        document.getElementById('vs-bg').onclick = () => { sheet.remove(); startSlideProgress(); };
+        document.getElementById('vs-close').onclick = () => { sheet.remove(); startSlideProgress(); };
       });
       
       document.getElementById('slide-next-zone')?.addEventListener('click', (e) => {
@@ -4126,6 +4327,27 @@
       if (msgContainer) {
         msgContainer.innerHTML = renderMessageList();
         msgContainer.scrollTop = msgContainer.scrollHeight;
+        // Wire long-press / right-click on message bubbles for delete
+        let pressTimer = null;
+        msgContainer.addEventListener('contextmenu', (e) => {
+          const bubble = e.target.closest('[data-msg-id]');
+          if (!bubble) return;
+          e.preventDefault();
+          const msgId = bubble.dataset.msgId;
+          const isOwn = bubble.dataset.isOwn === 'true';
+          showMessageDeleteSheet(msgId, isOwn);
+        });
+        msgContainer.addEventListener('touchstart', (e) => {
+          const bubble = e.target.closest('[data-msg-id]');
+          if (!bubble) return;
+          pressTimer = setTimeout(() => {
+            const msgId = bubble.dataset.msgId;
+            const isOwn = bubble.dataset.isOwn === 'true';
+            showMessageDeleteSheet(msgId, isOwn);
+          }, 600);
+        }, { passive: true });
+        msgContainer.addEventListener('touchend', () => { clearTimeout(pressTimer); pressTimer = null; }, { passive: true });
+        msgContainer.addEventListener('touchmove', () => { clearTimeout(pressTimer); pressTimer = null; }, { passive: true });
       }
     }
 
@@ -4656,43 +4878,43 @@
         <div id="slide-modal" class="hidden fixed inset-0 bg-black/90 flex items-center justify-center z-50 p-4">
           <div class="bg-white rounded-2xl w-full max-w-md overflow-hidden">
             <div class="p-4 border-b border-gray-200 flex items-center justify-between">
-              <h2 class="text-xl font-semibold text-black">Create Slide</h2>
+              <h2 class="text-xl font-semibold text-black">Create Status</h2>
               <button id="close-slide-modal" class="w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-gray-400 hover:text-white transition-colors">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
               </button>
             </div>
-            <div class="p-4">
-              <p class="text-gray-500 text-sm mb-4">Share an update with your circle (disappears after 24 hours)</p>
-              
-              <!-- Image Upload Section -->
-              <div id="slide-image-section" class="mb-4">
-                <div id="slide-image-preview" class="hidden relative rounded-lg overflow-hidden mb-3">
-                  <img id="slide-preview-img" src="" alt="Preview" class="w-full h-48 object-cover">
-                  <button id="remove-slide-image" class="absolute top-2 right-2 w-8 h-8 bg-black/70 rounded-full flex items-center justify-center text-white hover:bg-black transition-colors">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                </div>
-                <label id="slide-image-upload-btn" class="flex items-center justify-center gap-2 w-full py-3 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-gray-400 transition-colors">
-                  <svg class="w-6 h-6 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                  </svg>
-                  <span class="text-gray-400">Add Photo</span>
-                  <input type="file" id="slide-image-input" accept="image/*" class="hidden">
-                </label>
+            <div class="p-4 space-y-3">
+              <!-- Media upload area -->
+              <div id="slide-media-preview" class="hidden relative rounded-xl overflow-hidden bg-black">
+                <img id="slide-preview-img" src="" alt="Preview" class="w-full h-48 object-cover hidden">
+                <video id="slide-preview-vid" class="w-full h-48 object-cover hidden" controls playsinline></video>
+                <button id="remove-slide-image" class="absolute top-2 right-2 w-8 h-8 bg-black/70 rounded-full flex items-center justify-center text-white">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
               </div>
-              
-              <textarea id="slide-content" placeholder="Add a caption (optional)" class="w-full bg-gray-100 border border-gray-200 rounded-lg px-4 py-3 text-black placeholder-gray-400 focus:outline-none focus:border-gray-400 transition-colors resize-none h-24" maxlength="280"></textarea>
-              <div class="flex justify-between items-center mt-2">
+              <label id="slide-image-upload-btn" class="flex items-center justify-center gap-2 w-full py-3 border-2 border-dashed border-gray-300 rounded-xl cursor-pointer hover:border-gray-400 transition-colors">
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                <span class="text-gray-500 text-sm">Add Photo or Video</span>
+                <input type="file" id="slide-image-input" accept="image/*,video/*" class="hidden">
+              </label>
+              <!-- Caption -->
+              <textarea id="slide-content" placeholder="Add a caption (optional)" class="w-full bg-gray-100 border border-gray-200 rounded-xl px-4 py-3 text-black placeholder-gray-400 focus:outline-none focus:border-gray-400 resize-none h-20 text-sm" maxlength="280"></textarea>
+              <div class="flex items-center justify-between">
                 <span id="slide-char-count" class="text-gray-400 text-xs">0/280</span>
+              </div>
+              <!-- Duration selector -->
+              <div>
+                <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Status lasts for</p>
+                <div class="flex gap-2">
+                  <button class="slide-dur-btn flex-1 py-2 rounded-lg border-2 border-gray-200 text-sm font-semibold text-gray-600 hover:border-black hover:text-black transition-all" data-hours="10">10 hrs</button>
+                  <button class="slide-dur-btn flex-1 py-2 rounded-lg border-2 border-gray-200 text-sm font-semibold text-gray-600 hover:border-black hover:text-black transition-all" data-hours="15">15 hrs</button>
+                  <button class="slide-dur-btn flex-1 py-2 rounded-lg border-2 border-black text-sm font-semibold text-black bg-gray-50 transition-all" data-hours="24">24 hrs</button>
+                </div>
               </div>
             </div>
             <div class="p-4 border-t border-gray-200 flex gap-3">
-              <button id="cancel-slide" class="flex-1 py-3 rounded-lg bg-gray-100 text-black font-medium hover:bg-gray-200 transition-colors">Cancel</button>
-              <button id="post-slide" class="flex-1 py-3 rounded-lg bg-white text-black font-medium hover:bg-gray-200 transition-colors">Post Slide</button>
+              <button id="cancel-slide" class="flex-1 py-3 rounded-xl bg-gray-100 text-black font-medium hover:bg-gray-200 transition-colors">Cancel</button>
+              <button id="post-slide" class="flex-1 py-3 rounded-xl bg-black text-white font-medium hover:bg-gray-900 transition-colors">Post Status</button>
             </div>
           </div>
         </div>
@@ -5388,106 +5610,132 @@
         document.getElementById('slide-char-count').textContent = `${count}/280`;
       });
 
-      // Slide image upload
+      // Slide media upload (handled below)
       let slideImageFile = null;
-      let slideImagePreviewUrl = null;
 
-      document.getElementById('slide-image-input')?.addEventListener('change', (e) => {
+      // Duration selection for slide modal
+      let slideDurationHours = 24;
+      document.querySelectorAll('.slide-dur-btn').forEach(b => {
+        b.addEventListener('click', () => {
+          slideDurationHours = parseInt(b.dataset.hours);
+          document.querySelectorAll('.slide-dur-btn').forEach(x => {
+            x.classList.remove('border-black', 'text-black', 'bg-gray-50');
+            x.classList.add('border-gray-200', 'text-gray-600');
+          });
+          b.classList.add('border-black', 'text-black', 'bg-gray-50');
+          b.classList.remove('border-gray-200', 'text-gray-600');
+        });
+      });
+
+      // Slide media file handling (image OR video)
+      let slideVideoFile = null;
+
+      document.getElementById('slide-image-input')?.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        
-        // Validate file type
-        if (!file.type.startsWith('image/')) {
-          alert('Please select an image file');
-          return;
-        }
-        
-        // Validate file size (max 10MB)
-        if (file.size > 10 * 1024 * 1024) {
-          alert('Image must be less than 10MB');
-          return;
-        }
-        
-        slideImageFile = file;
-        slideImagePreviewUrl = URL.createObjectURL(file);
-        
-        // Show preview
-        const preview = document.getElementById('slide-image-preview');
+        const isVid = file.type.startsWith('video/');
+        const isImg = file.type.startsWith('image/');
+        if (!isImg && !isVid) { alert('Please choose an image or video.'); return; }
+        if (file.size > 50 * 1024 * 1024) { alert('File must be under 50MB.'); return; }
+
+        const previewWrap = document.getElementById('slide-media-preview');
         const previewImg = document.getElementById('slide-preview-img');
+        const previewVid = document.getElementById('slide-preview-vid');
         const uploadBtn = document.getElementById('slide-image-upload-btn');
-        
-        if (preview && previewImg) {
-          previewImg.src = slideImagePreviewUrl;
-          preview.classList.remove('hidden');
-          uploadBtn?.classList.add('hidden');
+
+        if (isVid) {
+          slideImageFile = null;
+          slideVideoFile = file;
+          previewImg.classList.add('hidden');
+          previewVid.src = URL.createObjectURL(file);
+          previewVid.classList.remove('hidden');
+        } else {
+          slideVideoFile = null;
+          slideImageFile = file;
+          previewVid.classList.add('hidden');
+          previewImg.src = URL.createObjectURL(file);
+          previewImg.classList.remove('hidden');
         }
+        previewWrap.classList.remove('hidden');
+        uploadBtn.classList.add('hidden');
       });
 
       document.getElementById('remove-slide-image')?.addEventListener('click', () => {
         slideImageFile = null;
-        if (slideImagePreviewUrl) {
-          URL.revokeObjectURL(slideImagePreviewUrl);
-          slideImagePreviewUrl = null;
-        }
-        
-        const preview = document.getElementById('slide-image-preview');
-        const uploadBtn = document.getElementById('slide-image-upload-btn');
-        const input = document.getElementById('slide-image-input');
-        
-        preview?.classList.add('hidden');
-        uploadBtn?.classList.remove('hidden');
-        if (input) input.value = '';
+        slideVideoFile = null;
+        const previewWrap = document.getElementById('slide-media-preview');
+        const previewImg = document.getElementById('slide-preview-img');
+        const previewVid = document.getElementById('slide-preview-vid');
+        previewImg.src = ''; previewImg.classList.add('hidden');
+        previewVid.src = ''; previewVid.classList.add('hidden');
+        previewWrap.classList.add('hidden');
+        document.getElementById('slide-image-upload-btn')?.classList.remove('hidden');
+        const inp = document.getElementById('slide-image-input');
+        if (inp) inp.value = '';
       });
 
       document.getElementById('post-slide')?.addEventListener('click', async () => {
         const content = document.getElementById('slide-content')?.value?.trim();
-        
-        // Require either content or image
-        if (!content && !slideImageFile) {
-          alert('Please add a photo or caption');
+        if (!content && !slideImageFile && !slideVideoFile) {
+          alert('Please add a photo, video or caption');
           return;
         }
-
         const btn = document.getElementById('post-slide');
         btn.disabled = true;
         btn.textContent = 'Posting...';
-
         try {
           let imageUrl = null;
-          
-          // Upload image if selected
+          let videoUrl = null;
           if (slideImageFile) {
             btn.textContent = 'Uploading...';
             imageUrl = await uploadSlideImage(slideImageFile);
           }
-          
-          // Post the slide
-          await postSlideWithImage(content, imageUrl);
-          
-          // Reset form
+          if (slideVideoFile) {
+            btn.textContent = 'Uploading video...';
+            videoUrl = await new Promise((res, rej) => {
+              const r = new FileReader();
+              r.onload = e => res(e.target.result);
+              r.onerror = () => rej(new Error('Failed to read video'));
+              r.readAsDataURL(slideVideoFile);
+            });
+          }
+
+          const durationMs = slideDurationHours * 60 * 60 * 1000;
+          await addDoc(collection(db, 'slides'), {
+            userId: state.user.uid,
+            userName: state.userData.name,
+            userAvatar: state.userData.avatar || '',
+            content: content || '',
+            imageUrl: imageUrl || null,
+            videoUrl: videoUrl || null,
+            type: videoUrl ? 'video' : imageUrl ? 'image' : 'text',
+            backgroundColor: getRandomSlideColor(),
+            viewedBy: [],
+            durationHours: slideDurationHours,
+            createdAt: serverTimestamp(),
+            expiresAt: new Date(Date.now() + durationMs)
+          });
+
+          // Reset
+          slideImageFile = null; slideVideoFile = null;
           document.getElementById('slide-modal')?.classList.add('hidden');
           document.getElementById('slide-content').value = '';
           document.getElementById('slide-char-count').textContent = '0/280';
-          
-          // Reset image
-          slideImageFile = null;
-          if (slideImagePreviewUrl) {
-            URL.revokeObjectURL(slideImagePreviewUrl);
-            slideImagePreviewUrl = null;
-          }
-          document.getElementById('slide-image-preview')?.classList.add('hidden');
+          document.getElementById('slide-media-preview')?.classList.add('hidden');
+          document.getElementById('slide-preview-img').src = '';
+          document.getElementById('slide-preview-img').classList.add('hidden');
+          document.getElementById('slide-preview-vid').src = '';
+          document.getElementById('slide-preview-vid').classList.add('hidden');
           document.getElementById('slide-image-upload-btn')?.classList.remove('hidden');
-          const input = document.getElementById('slide-image-input');
-          if (input) input.value = '';
-          
-          log('Slide posted successfully!');
+          const inp = document.getElementById('slide-image-input');
+          if (inp) inp.value = '';
+          log('Status posted!');
         } catch (err) {
-          log('Error posting slide: ' + err.message);
-          alert('Failed to post slide. Make sure Firebase Storage is enabled.');
+          log('Error posting status: ' + err.message);
+          alert('Failed to post: ' + err.message);
         }
-
         btn.disabled = false;
-        btn.textContent = 'Post Slide';
+        btn.textContent = 'Post Status';
       });
 
       // ONLY the avatar opens the contact profile — not the whole header row
@@ -5732,6 +5980,12 @@
           btn.classList.add('like-pop');
           setTimeout(() => btn.classList.remove('like-pop'), 300);
           await toggleLike(postId);
+        });
+        // Tap the like COUNT to see who liked
+        const countEl2 = btn.querySelector('.post-like-count');
+        countEl2?.addEventListener('click', (e2) => {
+          e2.stopPropagation();
+          showWhoLiked(btn.dataset.postId);
         });
       });
 
@@ -7527,7 +7781,7 @@
                 const docStyle = getDocIcon(fileExt);
                 
                 return `
-                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2" data-msg-id="${msg.id}">
+                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2" data-msg-id="${msg.id}" data-is-own="${isMe}" data-msg-id="${msg.id}" data-is-own="${isMe}">
                     <div class="${isMe ? 'bg-white' : 'bg-gray-800'} rounded-2xl ${isLastInGroup ? (isMe ? 'rounded-br-md' : 'rounded-bl-md') : ''} overflow-hidden shadow-sm" style="min-width: 250px; max-width: 300px;">
                       <div class="p-3">
                         <div class="flex items-center gap-3">
@@ -7576,7 +7830,7 @@
                 const durationStr = formatVoiceDuration(duration);
                 
                 return `
-                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2">
+                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2" data-msg-id="${msg.id}" data-is-own="${isMe}">
                     <div class="relative ${isMe ? 'bg-white' : 'bg-gray-800'} rounded-2xl ${isLastInGroup ? (isMe ? 'rounded-br-md' : 'rounded-bl-md') : ''} shadow-sm overflow-hidden" style="min-width: 250px; max-width: 300px;">
                       <div class="flex items-center gap-3 p-2">
                         <!-- Play button -->
@@ -7633,7 +7887,7 @@
                 if (!isValidImage) {
                   // Show placeholder for invalid/truncated images
                   return `
-                    <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2">
+                    <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2" data-msg-id="${msg.id}" data-is-own="${isMe}">
                       <div class="${isMe ? 'bg-white' : 'bg-gray-800'} rounded-2xl ${isLastInGroup ? (isMe ? 'rounded-br-md' : 'rounded-bl-md') : ''} overflow-hidden shadow-sm" style="max-width: 280px; min-width: 200px;">
                         <div class="p-4 text-center">
                           <svg class="w-12 h-12 mx-auto mb-2 ${isMe ? 'text-gray-400' : 'text-gray-500'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -7652,7 +7906,7 @@
                 }
                 
                 return `
-                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2">
+                  <div class="flex ${isMe ? 'justify-end' : 'justify-start'} ${isFirstInGroup ? 'mt-2' : ''} px-2" data-msg-id="${msg.id}" data-is-own="${isMe}">
                     <div class="relative cursor-pointer overflow-hidden" 
                          style="max-width: 280px; min-width: 200px;"
                          onclick="openFullscreenImage('${imageUrl}', '${escapedCaption}', '${formatMessageTime(msg.timestamp)}')">
